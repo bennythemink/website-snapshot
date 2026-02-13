@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -52,6 +51,7 @@ class Job:
     url: str
     slug: str
     extra_domains: list[str]
+    remove_links: bool = False
     status: JobStatus = JobStatus.PENDING
     output_dir: Path = Path(".")
     site_dir: Path = Path(".")
@@ -110,6 +110,67 @@ def _find_main_html(site_dir: Path, url: str) -> str | None:
                 return os.path.relpath(os.path.join(root, f), site_dir)
 
     return None
+
+
+def _strip_links(site_dir: Path) -> int:
+    """Remove href values from all <a> tags in HTML files under site_dir.
+
+    Links remain visible but point nowhere (href="").
+    Returns the total number of links modified.
+    """
+    link_pattern = re.compile(
+        r"""(<a\b[^>]*?)\s+href\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""",
+        re.IGNORECASE,
+    )
+    total = 0
+    for root, _dirs, files in os.walk(site_dir):
+        for fname in files:
+            if not fname.endswith((".html", ".htm")):
+                continue
+            fpath = Path(root) / fname
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            new_content, count = link_pattern.subn(r'\1 href=""', content)
+            if count > 0:
+                fpath.write_text(new_content, encoding="utf-8")
+                total += count
+    return total
+
+
+def _write_robots_txt(site_dir: Path) -> None:
+    """Write a robots.txt at the site root that blocks all crawlers."""
+    content = "User-agent: *\nDisallow: /\n"
+    (site_dir / "robots.txt").write_text(content)
+
+
+def _inject_noindex(site_dir: Path) -> int:
+    """Inject a noindex/nofollow meta tag into every HTML file's <head>.
+
+    Returns the number of files modified.
+    """
+    meta_tag = '<meta name="robots" content="noindex, nofollow">'
+    head_pattern = re.compile(r"(<head[^>]*>)", re.IGNORECASE)
+    count = 0
+    for root, _dirs, files in os.walk(site_dir):
+        for fname in files:
+            if not fname.endswith((".html", ".htm")):
+                continue
+            fpath = Path(root) / fname
+            try:
+                html = fpath.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if meta_tag in html:
+                continue  # already present
+            new_html, replacements = head_pattern.subn(
+                rf"\1\n    {meta_tag}", html, count=1,
+            )
+            if replacements:
+                fpath.write_text(new_html, encoding="utf-8")
+                count += 1
+    return count
 
 
 def _validate_url(url: str) -> str:
@@ -236,7 +297,12 @@ async def _run_wget(job: Job) -> None:
 # Public API
 # ---------------------------------------------------------------------------
 
-def create_job(url: str, slug_raw: str | None, extra_domains_raw: str | None) -> Job:
+def create_job(
+    url: str,
+    slug_raw: str | None,
+    extra_domains_raw: str | None,
+    remove_links: bool = False,
+) -> Job:
     """Validate inputs, set up the output directory, return a Job."""
     url = _validate_url(url)
     slug = sanitise_slug(slug_raw, url)
@@ -256,6 +322,7 @@ def create_job(url: str, slug_raw: str | None, extra_domains_raw: str | None) ->
         url=url,
         slug=slug,
         extra_domains=extra_domains,
+        remove_links=remove_links,
         output_dir=output_dir,
         site_dir=site_dir,
     )
@@ -276,6 +343,20 @@ async def run_clone(job: Job) -> None:
         await job.queue.put(f"[info] Extra domains: {', '.join(job.extra_domains)}")
 
     await _run_wget(job)
+
+    # Post-processing: block search-engine indexing
+    if job.status == JobStatus.COMPLETED:
+        await job.queue.put("[info] Adding robots.txt (disallow all crawlers)")
+        _write_robots_txt(job.site_dir)
+        await job.queue.put("[info] Injecting noindex meta tags into HTML files…")
+        noindex_count = _inject_noindex(job.site_dir)
+        await job.queue.put(f"[info] Added noindex meta tag to {noindex_count} HTML file(s)")
+
+    # Post-processing: strip links if requested
+    if job.remove_links and job.status == JobStatus.COMPLETED:
+        await job.queue.put("[info] Removing links from HTML files…")
+        count = _strip_links(job.site_dir)
+        await job.queue.put(f"[info] Stripped href from {count} link(s)")
 
     if job.status == JobStatus.COMPLETED:
         generate_bundle(job)

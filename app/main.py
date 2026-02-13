@@ -12,6 +12,7 @@ GET  /preview/{job_id}/{path}    → Serve the downloaded static site for previe
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import AsyncGenerator
 
@@ -21,7 +22,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from app.cloner import Job, JobStatus, create_job, jobs, run_clone
+from app.cloner import Job, create_job, jobs, run_clone
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -46,6 +47,7 @@ class CloneRequest(BaseModel):
     url: str
     slug: str | None = None
     extra_domains: str | None = None
+    remove_links: bool = False
 
 
 class CloneResponse(BaseModel):
@@ -68,7 +70,7 @@ async def index(request: Request):
 async def start_clone(body: CloneRequest):
     """Validate inputs, create a job, kick off the background clone."""
     try:
-        job: Job = create_job(body.url, body.slug, body.extra_domains)
+        job: Job = create_job(body.url, body.slug, body.extra_domains, body.remove_links)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -163,8 +165,6 @@ async def list_jobs():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-import json
 
 
 def _json_str(obj: dict) -> str:
