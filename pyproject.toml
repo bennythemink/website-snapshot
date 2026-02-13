@@ -1,0 +1,17 @@
+[project]
+name = "snapshot"
+version = "1.0.0"
+description = "Clone a single web page and generate a deploy-ready Docker bundle"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiofiles>=25.1.0",
+    "fastapi[standard]>=0.129.0",
+    "jinja2>=3.1.6",
+    "sse-starlette>=3.2.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.1",
+]

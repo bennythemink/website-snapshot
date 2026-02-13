@@ -1,0 +1,15 @@
+services:
+  snapshot:
+    build: .
+    container_name: snapshot_app
+    restart: unless-stopped
+    ports:
+      - '8080:8080'
+    volumes:
+      - ./downloads:/app/downloads
+    networks:
+      - caddy_net
+
+networks:
+  caddy_net:
+    external: true

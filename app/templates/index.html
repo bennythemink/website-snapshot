@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Snapshot – Web Page Cloner</title>
+    <style>
+      :root {
+        --bg: #0f1117;
+        --surface: #1a1d27;
+        --border: #2a2d3a;
+        --text: #e1e4ed;
+        --muted: #8b8fa3;
+        --accent: #6c5ce7;
+        --accent-hover: #7c6ef7;
+        --success: #00b894;
+        --error: #e17055;
+        --font-mono: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+        --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      }
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family: var(--font-sans);
+        background: var(--bg);
+        color: var(--text);
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 2rem 1rem;
+      }
+      .container {
+        width: 100%;
+        max-width: 740px;
+      }
+      h1 {
+        font-size: 1.6rem;
+        font-weight: 700;
+        margin-bottom: 0.25rem;
+      }
+      .subtitle {
+        color: var(--muted);
+        font-size: 0.9rem;
+        margin-bottom: 2rem;
+      }
+      .card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin-bottom: 1.25rem;
+      }
+      label {
+        display: block;
+        font-size: 0.82rem;
+        font-weight: 600;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        margin-bottom: 0.4rem;
+      }
+      input[type='text'],
+      input[type='url'],
+      textarea {
+        width: 100%;
+        padding: 0.65rem 0.85rem;
+        font-size: 0.95rem;
+        font-family: var(--font-mono);
+        background: var(--bg);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        outline: none;
+        transition: border-color 0.15s;
+      }
+      input:focus,
+      textarea:focus {
+        border-color: var(--accent);
+      }
+      textarea {
+        resize: vertical;
+        min-height: 52px;
+      }
+      .field {
+        margin-bottom: 1rem;
+      }
+      .field:last-child {
+        margin-bottom: 0;
+      }
+      .hint {
+        font-size: 0.78rem;
+        color: var(--muted);
+        margin-top: 0.25rem;
+      }
+      .row {
+        display: flex;
+        gap: 1rem;
+      }
+      .row > .field {
+        flex: 1;
+      }
+      button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.5rem;
+        width: 100%;
+        padding: 0.75rem 1.5rem;
+        font-size: 0.95rem;
+        font-weight: 600;
+        color: #fff;
+        background: var(--accent);
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+        transition:
+          background 0.15s,
+          opacity 0.15s;
+      }
+      button:hover:not(:disabled) {
+        background: var(--accent-hover);
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      /* Log area */
+      #log-section {
+        display: none;
+      }
+      #log-section.visible {
+        display: block;
+      }
+      .log-area {
+        background: #000;
+        color: #a4e4a0;
+        font-family: var(--font-mono);
+        font-size: 0.82rem;
+        line-height: 1.55;
+        padding: 1rem;
+        border-radius: 8px;
+        max-height: 380px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+
+      /* Result area */
+      #result-section {
+        display: none;
+      }
+      #result-section.visible {
+        display: block;
+      }
+      .result-row {
+        display: flex;
+        align-items: baseline;
+        gap: 0.5rem;
+        margin-bottom: 0.6rem;
+        font-size: 0.9rem;
+      }
+      .result-row .label-text {
+        font-weight: 600;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .result-row a {
+        color: var(--accent);
+        text-decoration: none;
+      }
+      .result-row a:hover {
+        text-decoration: underline;
+      }
+      .result-row code {
+        font-family: var(--font-mono);
+        font-size: 0.84rem;
+        background: var(--bg);
+        padding: 0.15rem 0.5rem;
+        border-radius: 4px;
+        user-select: all;
+      }
+      .status-badge {
+        display: inline-block;
+        padding: 0.15rem 0.6rem;
+        border-radius: 20px;
+        font-size: 0.78rem;
+        font-weight: 600;
+        text-transform: uppercase;
+      }
+      .status-badge.completed {
+        background: rgba(0, 184, 148, 0.15);
+        color: var(--success);
+      }
+      .status-badge.failed {
+        background: rgba(225, 112, 85, 0.15);
+        color: var(--error);
+      }
+
+      .disclaimer {
+        text-align: center;
+        font-size: 0.75rem;
+        color: var(--muted);
+        margin-top: 2rem;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>📸 Snapshot</h1>
+      <p class="subtitle">Clone a single web page and get a deploy-ready Docker bundle.</p>
+
+      <!-- Input form -->
+      <form id="clone-form" class="card">
+        <div class="field">
+          <label for="url">Page URL</label>
+          <input type="url" id="url" name="url" placeholder="https://example.com/page" required />
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="slug"
+              >Project slug <span style="text-transform: none; font-weight: 400">(optional)</span></label
+            >
+            <input type="text" id="slug" name="slug" placeholder="my-landing-page" />
+            <div class="hint">Used for folder &amp; container name. Auto-derived from URL if blank.</div>
+          </div>
+        </div>
+        <div class="field">
+          <label for="extra_domains"
+            >Extra asset domains <span style="text-transform: none; font-weight: 400">(optional)</span></label
+          >
+          <textarea
+            id="extra_domains"
+            name="extra_domains"
+            rows="2"
+            placeholder="fonts.googleapis.com, fonts.gstatic.com, cdn.jsdelivr.net"
+          ></textarea>
+          <div class="hint">
+            Comma-separated. Allows wget to fetch assets from these hosts in addition to the page's own domain.
+          </div>
+        </div>
+        <button type="submit" id="btn-clone">
+          <svg
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+          Clone &amp; Generate Bundle
+        </button>
+      </form>
+
+      <!-- Log output -->
+      <div id="log-section" class="card">
+        <label>Progress log</label>
+        <div id="log" class="log-area"></div>
+      </div>
+
+      <!-- Result summary -->
+      <div id="result-section" class="card">
+        <label>Result</label>
+        <div id="result-content"></div>
+      </div>
+
+      <p class="disclaimer">
+        ⚠️ Only clone pages you have rights to copy. Cloning may violate the source site's Terms of Service.
+      </p>
+    </div>
+
+    <script>
+      const form = document.getElementById('clone-form')
+      const btnClone = document.getElementById('btn-clone')
+      const logSection = document.getElementById('log-section')
+      const logEl = document.getElementById('log')
+      const resultSection = document.getElementById('result-section')
+      const resultContent = document.getElementById('result-content')
+
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault()
+        btnClone.disabled = true
+        btnClone.textContent = 'Cloning…'
+        logSection.classList.add('visible')
+        resultSection.classList.remove('visible')
+        logEl.textContent = ''
+        resultContent.innerHTML = ''
+
+        const payload = {
+          url: document.getElementById('url').value.trim(),
+          slug: document.getElementById('slug').value.trim() || null,
+          extra_domains: document.getElementById('extra_domains').value.trim() || null
+        }
+
+        let jobId
+        try {
+          const res = await fetch('/api/clone', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          })
+          if (!res.ok) {
+            const err = await res.json()
+            throw new Error(err.detail || res.statusText)
+          }
+          const data = await res.json()
+          jobId = data.job_id
+        } catch (err) {
+          appendLog(`[error] ${err.message}`)
+          resetButton()
+          return
+        }
+
+        // Open SSE stream
+        const evtSource = new EventSource(`/api/clone/${jobId}/events`)
+
+        evtSource.addEventListener('log', (e) => {
+          appendLog(e.data)
+        })
+
+        evtSource.addEventListener('done', (e) => {
+          evtSource.close()
+          const info = JSON.parse(e.data)
+          showResult(info, jobId)
+          resetButton()
+        })
+
+        evtSource.addEventListener('error', () => {
+          appendLog('[error] SSE connection lost.')
+          evtSource.close()
+          resetButton()
+        })
+      })
+
+      function appendLog(line) {
+        logEl.textContent += line + '\n'
+        logEl.scrollTop = logEl.scrollHeight
+      }
+
+      function resetButton() {
+        btnClone.disabled = false
+        btnClone.innerHTML = `
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Clone &amp; Generate Bundle`
+      }
+
+      function showResult(info, jobId) {
+        resultSection.classList.add('visible')
+        let html = ''
+
+        const statusClass = info.status === 'completed' ? 'completed' : 'failed'
+        html += `<div class="result-row">
+        <span class="label-text">Status:</span>
+        <span class="status-badge ${statusClass}">${info.status}</span>
+      </div>`
+
+        if (info.preview_url) {
+          html += `<div class="result-row">
+          <span class="label-text">Preview:</span>
+          <a href="${info.preview_url}" target="_blank">Open preview ↗</a>
+        </div>`
+        }
+
+        html += `<div class="result-row">
+        <span class="label-text">Bundle:</span>
+        <code>${info.output_dir}</code>
+      </div>`
+
+        html += `<div class="result-row">
+        <span class="label-text">Deploy:</span>
+        <code>cd ${info.output_dir} && docker compose up -d --build</code>
+      </div>`
+
+        if (info.error) {
+          html += `<div class="result-row">
+          <span class="label-text">Error:</span>
+          <span style="color:var(--error)">${info.error}</span>
+        </div>`
+        }
+
+        resultContent.innerHTML = html
+      }
+    </script>
+  </body>
+</html>
