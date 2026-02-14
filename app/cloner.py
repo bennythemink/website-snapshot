@@ -139,6 +139,127 @@ def _strip_links(site_dir: Path) -> int:
     return total
 
 
+def _fix_css_fragment_references(site_dir: Path) -> int:
+    """Restore CSS ``url(#id)`` references corrupted by wget ``--convert-links``.
+
+    wget's ``--convert-links`` misinterprets same-document SVG fragment
+    references such as ``url(#home-clipping-path)`` inside CSS files and
+    rewrites them as relative paths that point back at the CSS file itself
+    (e.g. ``url(main.css)``).  This breaks ``clip-path``, ``filter``,
+    ``mask``, and ``fill`` references to inline SVG definitions.
+
+    Strategy:
+     1. Collect every ``id`` from ``<clipPath>``, ``<filter>``, ``<mask>``,
+        and ``<linearGradient>``/``<radialGradient>`` elements found in the
+        downloaded HTML files.
+     2. For each CSS file, find ``url(...)`` values where the reference
+        matches the CSS file's own name (the telltale sign of corruption).
+     3. Replace those self-references with the matching ``url(#id)`` using
+        the collected SVG IDs.
+
+    Returns the total number of ``url()`` values restored.
+    """
+    # ------------------------------------------------------------------
+    # Step 1 – harvest SVG-definition IDs from all HTML files
+    # ------------------------------------------------------------------
+    svg_id_pattern = re.compile(
+        r"<(?:clipPath|filter|mask|linearGradient|radialGradient)"
+        r'[^>]+\bid\s*=\s*["\']([^"\']+)["\']',
+        re.IGNORECASE,
+    )
+    svg_ids: set[str] = set()
+
+    for root, _dirs, files in os.walk(site_dir):
+        for fname in files:
+            if not fname.endswith((".html", ".htm")):
+                continue
+            fpath = Path(root) / fname
+            try:
+                html = fpath.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            svg_ids.update(svg_id_pattern.findall(html))
+
+    if not svg_ids:
+        return 0  # nothing to fix
+
+    # ------------------------------------------------------------------
+    # Step 2 & 3 – scan CSS files and restore corrupted url() values
+    # ------------------------------------------------------------------
+    total_fixed = 0
+
+    for root, _dirs, files in os.walk(site_dir):
+        for fname in files:
+            if not fname.endswith(".css"):
+                continue
+            fpath = Path(root) / fname
+
+            try:
+                css = fpath.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            # Build a pattern that matches url(<this-css-filename>)
+            # wget may or may not add a path prefix, but the filename
+            # (possibly with query-string mangling) will always appear.
+            # Escape the filename for regex and allow optional leading path.
+            escaped_name = re.escape(fname)
+            self_ref = re.compile(
+                r"url\(\s*" + r"(?:[^)]*/)?" + escaped_name + r"\s*\)",
+                re.IGNORECASE,
+            )
+
+            if not self_ref.search(css):
+                continue
+
+            # If there is exactly one SVG ID we can replace directly.
+            # If there are multiple, we try to narrow down by looking at
+            # CSS property context (clip-path → clipPath, filter → filter, etc.)
+            # For safety, if we cannot disambiguate we still fix single-ID cases.
+            def _replace(match: re.Match) -> str:  # noqa: ANN001
+                """Pick the right SVG fragment ID for this url() occurrence."""
+                # Walk backwards from the match to find the CSS property name
+                start = max(0, match.start() - 200)
+                context = css[start:match.start()]
+                # Find the last property name before this url()
+                prop_match = re.findall(
+                    r"([\w-]+)\s*:\s*[^;]*$", context, re.DOTALL,
+                )
+                prop_name = prop_match[-1].lower() if prop_match else ""
+
+                # Try to pick the best SVG ID by matching property to tag type
+                prop_tag_map = {
+                    "clip-path": "clip",
+                    "-webkit-clip-path": "clip",
+                    "filter": "filter",
+                    "mask": "mask",
+                    "fill": "gradient",
+                    "background": "gradient",
+                }
+                hint = prop_tag_map.get(prop_name, "")
+
+                # Score each SVG ID by how well it matches the context
+                best: str | None = None
+                for sid in svg_ids:
+                    sid_lower = sid.lower()
+                    if hint and hint in sid_lower:
+                        best = sid
+                        break  # good match
+                    if best is None:
+                        best = sid  # fallback to first
+
+                if best:
+                    return f"url(#{best})"
+                return match.group(0)  # leave unchanged if no IDs
+
+            new_css, count = self_ref.subn(_replace, css)
+            if count:
+                fpath.write_text(new_css, encoding="utf-8")
+                total_fixed += count
+
+    return total_fixed
+
+
 def _write_robots_txt(site_dir: Path) -> None:
     """Write a robots.txt at the site root that blocks all crawlers."""
     content = "User-agent: *\nDisallow: /\n"
@@ -346,6 +467,10 @@ async def run_clone(job: Job) -> None:
 
     # Post-processing: block search-engine indexing
     if job.status == JobStatus.COMPLETED:
+        await job.queue.put("[info] Fixing CSS url(#…) fragment references corrupted by wget…")
+        frag_count = _fix_css_fragment_references(job.site_dir)
+        await job.queue.put(f"[info] Restored {frag_count} CSS fragment reference(s)")
+
         await job.queue.put("[info] Adding robots.txt (disallow all crawlers)")
         _write_robots_txt(job.site_dir)
         await job.queue.put("[info] Injecting noindex meta tags into HTML files…")
