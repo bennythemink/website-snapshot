@@ -327,6 +327,7 @@ def _build_wget_args(url: str, site_dir: Path, extra_domains: list[str]) -> list
         "--tries=2",
         "--wait=0.2",
         "--no-verbose",              # progress but not debug
+        "-nH",                       # no host-name directories
         "-e", "robots=off",
         "-P", str(site_dir),
     ]

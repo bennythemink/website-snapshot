@@ -51,7 +51,7 @@ def _write_dockerfile(out: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def _write_compose(out: Path, slug: str) -> None:
-    service_name = f"snapshot_{slug}"
+    service_name = slug
     content = textwrap.dedent(f"""\
         services:
           {service_name}:
@@ -64,10 +64,10 @@ def _write_compose(out: Path, slug: str) -> None:
             # ports:
             #   - "8090:80"
             networks:
-              - caddy_net
+              - caddy-net
 
         networks:
-          caddy_net:
+          caddy-net:
             external: true
     """)
     (out / "docker-compose.yml").write_text(content)
@@ -78,7 +78,7 @@ def _write_compose(out: Path, slug: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _write_readme(out: Path, slug: str, url: str) -> None:
-    service_name = f"snapshot_{slug}"
+    service_name = slug
     content = textwrap.dedent(f"""\
         # Snapshot: {slug}
 
@@ -91,7 +91,7 @@ def _write_readme(out: Path, slug: str, url: str) -> None:
 
         ```bash
         # 1. Ensure the shared Docker network exists
-        docker network create caddy_net || true
+        docker network create caddy-net || true
 
         # 2. Build & run
         docker compose up -d --build
@@ -123,12 +123,12 @@ def _write_readme(out: Path, slug: str, url: str) -> None:
         |------|-------------|
         | `site/` | Downloaded HTML, CSS, JS, and assets |
         | `Dockerfile` | Builds an nginx:alpine image with the site |
-        | `docker-compose.yml` | Runs the container on `caddy_net` |
+        | `docker-compose.yml` | Runs the container on `caddy-net` |
 
         ## Notes
 
         - The container exposes port **80** internally (no host port published
-          by default).  Caddy reaches it via the `caddy_net` Docker network.
+          by default).  Caddy reaches it via the `caddy-net` Docker network.
         - To test locally without Caddy, uncomment the `ports:` section in
           `docker-compose.yml`.
     """)

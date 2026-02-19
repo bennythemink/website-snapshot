@@ -8,8 +8,8 @@ services:
     volumes:
       - ./downloads:/app/downloads
     networks:
-      - caddy_net
+      - caddy-net
 
 networks:
-  caddy_net:
+  caddy-net:
     external: true
