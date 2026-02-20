@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -32,6 +33,10 @@ MAX_TIMEOUT_SECONDS = 120  # 2 minutes
 MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024  # 200 MB
 SLUG_MAX_LENGTH = 48
 SLUG_PATTERN = re.compile(r"[^a-z0-9-]")
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +97,15 @@ def _dir_size(path: Path) -> int:
             except OSError:
                 pass
     return total
+
+
+def _has_html_files(site_dir: Path) -> bool:
+    """Return True if site_dir contains at least one HTML file."""
+    for root, _dirs, files in os.walk(site_dir):
+        for f in files:
+            if f.endswith((".html", ".htm")):
+                return True
+    return False
 
 
 def _find_main_html(site_dir: Path, url: str) -> str | None:
@@ -311,7 +325,12 @@ def _validate_url(url: str) -> str:
 # wget command builder
 # ---------------------------------------------------------------------------
 
-def _build_wget_args(url: str, site_dir: Path, extra_domains: list[str]) -> list[str]:
+def _build_wget_args(
+    url: str,
+    site_dir: Path,
+    extra_domains: list[str],
+    user_agent: str | None = None,
+) -> list[str]:
     """Build the wget argument list.  Never use shell=True."""
     parsed = urlparse(url)
     host = parsed.hostname or ""
@@ -328,6 +347,7 @@ def _build_wget_args(url: str, site_dir: Path, extra_domains: list[str]) -> list
         "--wait=0.2",
         "--no-verbose",              # progress but not debug
         "-nH",                       # no host-name directories
+        *(["--user-agent=" + user_agent] if user_agent else []),
         "-e", "robots=off",
         "-P", str(site_dir),
     ]
@@ -348,62 +368,97 @@ def _build_wget_args(url: str, site_dir: Path, extra_domains: list[str]) -> list
 # ---------------------------------------------------------------------------
 
 async def _run_wget(job: Job) -> None:
-    """Spawn wget, stream output lines into job.queue, enforce limits."""
+    """Spawn wget, stream output lines into job.queue, enforce limits.
+
+    If the first attempt produces no HTML files, retry once with a
+    browser User-Agent header (many sites block wget's default UA).
+    """
     job.status = JobStatus.RUNNING
-
     site_dir = job.site_dir
-    site_dir.mkdir(parents=True, exist_ok=True)
 
-    args = _build_wget_args(job.url, site_dir, job.extra_domains)
-    cmd_display = " ".join(args)
-    await job.queue.put(f"[cmd] {cmd_display}")
+    async def _attempt(user_agent: str | None = None) -> int | None:
+        """Run one wget attempt.  Returns the process return code, or None on timeout."""
+        site_dir.mkdir(parents=True, exist_ok=True)
 
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+        args = _build_wget_args(job.url, site_dir, job.extra_domains, user_agent)
+        cmd_display = " ".join(args)
+        await job.queue.put(f"[cmd] {cmd_display}")
 
-    async def _stream(stream: asyncio.StreamReader, prefix: str):
-        while True:
-            line = await stream.readline()
-            if not line:
-                break
-            text = line.decode("utf-8", errors="replace").rstrip()
-            if text:
-                await job.queue.put(f"[{prefix}] {text}")
-            # Check size limit
-            if _dir_size(site_dir) > MAX_DOWNLOAD_BYTES:
-                await job.queue.put("[warn] Download size limit exceeded – killing wget.")
-                proc.kill()
-                return
-
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(
-                _stream(proc.stdout, "wget"),  # type: ignore[arg-type]
-                _stream(proc.stderr, "wget"),  # type: ignore[arg-type]
-                proc.wait(),
-            ),
-            timeout=MAX_TIMEOUT_SECONDS,
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-    except asyncio.TimeoutError:
-        proc.kill()
+
+        async def _stream(stream: asyncio.StreamReader, prefix: str):
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if text:
+                    await job.queue.put(f"[{prefix}] {text}")
+                if _dir_size(site_dir) > MAX_DOWNLOAD_BYTES:
+                    await job.queue.put("[warn] Download size limit exceeded – killing wget.")
+                    proc.kill()
+                    return
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    _stream(proc.stdout, "wget"),  # type: ignore[arg-type]
+                    _stream(proc.stderr, "wget"),  # type: ignore[arg-type]
+                    proc.wait(),
+                ),
+                timeout=MAX_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            return None
+
+        return proc.returncode
+
+    # ---- First attempt (default UA) ----
+    rc = await _attempt()
+
+    if rc is None:
         await job.queue.put("[error] wget timed out after 2 minutes.")
         job.status = JobStatus.FAILED
         job.error = "Timeout"
         await job.queue.put("[done]")
         return
 
-    rc = proc.returncode
-    if rc not in (0, 8):
-        # rc 8 = "Server issued an error response" but files may still be saved
+    got_html = _has_html_files(site_dir)
+
+    if rc in (0, 8) and got_html:
+        # First attempt succeeded
+        job.status = JobStatus.COMPLETED
+        await job.queue.put("[info] wget finished successfully.")
+    elif not got_html:
+        # No HTML downloaded — retry with browser User-Agent
+        await job.queue.put("[warn] No HTML files downloaded. Retrying with browser User-Agent…")
+        shutil.rmtree(site_dir, ignore_errors=True)
+
+        rc = await _attempt(user_agent=BROWSER_USER_AGENT)
+
+        if rc is None:
+            await job.queue.put("[error] wget timed out on retry.")
+            job.status = JobStatus.FAILED
+            job.error = "Timeout (retry)"
+            await job.queue.put("[done]")
+            return
+
+        if rc in (0, 8) and _has_html_files(site_dir):
+            job.status = JobStatus.COMPLETED
+            await job.queue.put("[info] Retry succeeded with browser User-Agent.")
+        else:
+            await job.queue.put(f"[error] Retry also failed (exit code {rc}).")
+            job.status = JobStatus.FAILED
+            job.error = f"wget exit code {rc} (after retry)"
+    else:
         await job.queue.put(f"[error] wget exited with code {rc}")
         job.status = JobStatus.FAILED
         job.error = f"wget exit code {rc}"
-    else:
-        job.status = JobStatus.COMPLETED
-        await job.queue.put("[info] wget finished successfully.")
 
     # Locate the main HTML
     main = _find_main_html(site_dir, job.url)
