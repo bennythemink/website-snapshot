@@ -48,6 +48,9 @@ class CloneRequest(BaseModel):
     slug: str | None = None
     extra_domains: str | None = None
     remove_links: bool = False
+    strip_dead_links: bool = False
+    max_pages: int = 1
+    crawl_depth: int = 0
 
 
 class CloneResponse(BaseModel):
@@ -70,7 +73,15 @@ async def index(request: Request):
 async def start_clone(body: CloneRequest):
     """Validate inputs, create a job, kick off the background clone."""
     try:
-        job: Job = create_job(body.url, body.slug, body.extra_domains, body.remove_links)
+        job: Job = create_job(
+            body.url,
+            body.slug,
+            body.extra_domains,
+            body.remove_links,
+            body.strip_dead_links,
+            body.max_pages,
+            body.crawl_depth,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

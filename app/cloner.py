@@ -57,6 +57,9 @@ class Job:
     slug: str
     extra_domains: list[str]
     remove_links: bool = False
+    strip_dead_links: bool = False
+    max_pages: int = 1
+    crawl_depth: int = 0
     status: JobStatus = JobStatus.PENDING
     output_dir: Path = Path(".")
     site_dir: Path = Path(".")
@@ -106,6 +109,16 @@ def _has_html_files(site_dir: Path) -> bool:
             if f.endswith((".html", ".htm")):
                 return True
     return False
+
+
+def _count_html_files(site_dir: Path) -> int:
+    """Count .html/.htm files under *site_dir*."""
+    count = 0
+    for _root, _dirs, files in os.walk(site_dir):
+        for f in files:
+            if f.endswith((".html", ".htm")):
+                count += 1
+    return count
 
 
 def _find_main_html(site_dir: Path, url: str) -> str | None:
@@ -274,6 +287,98 @@ def _fix_css_fragment_references(site_dir: Path) -> int:
     return total_fixed
 
 
+def _strip_dead_links(site_dir: Path) -> int:
+    """Remove href from <a> tags that point to pages not present in site_dir.
+
+    Links between downloaded pages are preserved.  Fragment-only links (#...)
+    and mailto:/tel: links are left untouched.
+
+    Returns the number of links stripped.
+    """
+    from urllib.parse import unquote, urlparse as _urlparse
+
+    # Build a set of all downloaded file paths (relative to site_dir)
+    downloaded: set[str] = set()
+    for root, _dirs, files in os.walk(site_dir):
+        for fname in files:
+            rel = os.path.relpath(os.path.join(root, fname), site_dir)
+            # Normalise separators
+            downloaded.add(rel.replace(os.sep, "/"))
+            # Also register directory index shorthand
+            if fname in ("index.html", "index.htm"):
+                parent_rel = os.path.relpath(root, site_dir).replace(os.sep, "/")
+                if parent_rel == ".":
+                    downloaded.add("")
+                else:
+                    downloaded.add(parent_rel)
+                    downloaded.add(parent_rel + "/")
+
+    href_re = re.compile(
+        r"""(<a\b[^>]*?)\s+href\s*=\s*(?:"([^"]*)"|'([^']*)')""",
+        re.IGNORECASE,
+    )
+    total = 0
+
+    for root, _dirs, files in os.walk(site_dir):
+        for fname in files:
+            if not fname.endswith((".html", ".htm")):
+                continue
+            fpath = Path(root) / fname
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            file_dir_rel = os.path.relpath(root, site_dir).replace(os.sep, "/")
+
+            def _check(match: re.Match) -> str:
+                nonlocal total
+                href = match.group(2) if match.group(2) is not None else match.group(3)
+                if href is None:
+                    return match.group(0)
+
+                # Skip fragment-only, empty, mailto, tel, javascript links
+                stripped = href.strip()
+                if not stripped or stripped.startswith(("#", "mailto:", "tel:", "javascript:")):
+                    return match.group(0)
+
+                # Parse and check if it's an external URL
+                parsed = _urlparse(stripped)
+                if parsed.scheme in ("http", "https", "//"):
+                    # External link — strip it
+                    total += 1
+                    return f'{match.group(1)} href=""'
+
+                # Resolve relative path
+                path_part = unquote(parsed.path)
+                if file_dir_rel and file_dir_rel != ".":
+                    resolved = os.path.normpath(file_dir_rel + "/" + path_part)
+                else:
+                    resolved = os.path.normpath(path_part)
+                resolved = resolved.replace(os.sep, "/")
+
+                # Check with and without .html extension
+                candidates = [resolved]
+                if not resolved.endswith((".html", ".htm")):
+                    candidates.append(resolved + "/index.html")
+                    candidates.append(resolved + "/index.htm")
+                    candidates.append(resolved + ".html")
+
+                for candidate in candidates:
+                    if candidate in downloaded:
+                        return match.group(0)  # Link target exists — keep it
+
+                # Target not downloaded — strip the href
+                total += 1
+                return f'{match.group(1)} href=""'
+
+            new_content = href_re.sub(_check, content)
+            if new_content != content:
+                fpath.write_text(new_content, encoding="utf-8")
+
+    return total
+
+
 def _write_robots_txt(site_dir: Path) -> None:
     """Write a robots.txt at the site root that blocks all crawlers."""
     content = "User-agent: *\nDisallow: /\n"
@@ -330,6 +435,7 @@ def _build_wget_args(
     site_dir: Path,
     extra_domains: list[str],
     user_agent: str | None = None,
+    crawl_depth: int = 0,
 ) -> list[str]:
     """Build the wget argument list.  Never use shell=True."""
     parsed = urlparse(url)
@@ -351,6 +457,10 @@ def _build_wget_args(
         "-e", "robots=off",
         "-P", str(site_dir),
     ]
+
+    # Recursive crawling
+    if crawl_depth > 0:
+        args += ["-r", f"--level={crawl_depth}"]
 
     all_domains = [host] + [d.strip() for d in extra_domains if d.strip()]
     if len(all_domains) > 1:
@@ -376,11 +486,19 @@ async def _run_wget(job: Job) -> None:
     job.status = JobStatus.RUNNING
     site_dir = job.site_dir
 
+    max_pages = job.max_pages
+    enforce_page_limit = job.crawl_depth > 0  # only kill for page count in recursive mode
+    pages_limit_hit = False  # set when we intentionally kill wget for page limit
+
     async def _attempt(user_agent: str | None = None) -> int | None:
         """Run one wget attempt.  Returns the process return code, or None on timeout."""
+        nonlocal pages_limit_hit
+        pages_limit_hit = False
         site_dir.mkdir(parents=True, exist_ok=True)
 
-        args = _build_wget_args(job.url, site_dir, job.extra_domains, user_agent)
+        args = _build_wget_args(
+            job.url, site_dir, job.extra_domains, user_agent, job.crawl_depth,
+        )
         cmd_display = " ".join(args)
         await job.queue.put(f"[cmd] {cmd_display}")
 
@@ -391,6 +509,7 @@ async def _run_wget(job: Job) -> None:
         )
 
         async def _stream(stream: asyncio.StreamReader, prefix: str):
+            nonlocal pages_limit_hit
             while True:
                 line = await stream.readline()
                 if not line:
@@ -398,9 +517,28 @@ async def _run_wget(job: Job) -> None:
                 text = line.decode("utf-8", errors="replace").rstrip()
                 if text:
                     await job.queue.put(f"[{prefix}] {text}")
-                if _dir_size(site_dir) > MAX_DOWNLOAD_BYTES:
-                    await job.queue.put("[warn] Download size limit exceeded – killing wget.")
-                    proc.kill()
+                # Combined size + page-count check in one walk
+                total_bytes = 0
+                html_count = 0
+                for dirpath, _dirnames, filenames in os.walk(site_dir):
+                    for fname in filenames:
+                        fp = os.path.join(dirpath, fname)
+                        try:
+                            total_bytes += os.path.getsize(fp)
+                        except OSError:
+                            pass
+                        if fname.endswith((".html", ".htm")):
+                            html_count += 1
+                if total_bytes > MAX_DOWNLOAD_BYTES:
+                    await job.queue.put("[warn] Download size limit exceeded – stopping wget.")
+                    proc.terminate()
+                    return
+                if enforce_page_limit and html_count > max_pages:
+                    pages_limit_hit = True
+                    await job.queue.put(
+                        f"[info] Reached max pages limit ({max_pages}) – stopping wget."
+                    )
+                    proc.terminate()
                     return
 
         try:
@@ -413,8 +551,21 @@ async def _run_wget(job: Job) -> None:
                 timeout=MAX_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
-            proc.kill()
+            proc.terminate()
+            # Give wget a grace period to finish --convert-links
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                proc.kill()
             return None
+
+        # If we sent SIGTERM (page/size limit), allow a grace period
+        # for wget to finish its --convert-links post-processing.
+        if proc.returncode is None:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=8)
+            except asyncio.TimeoutError:
+                proc.kill()
 
         return proc.returncode
 
@@ -430,10 +581,13 @@ async def _run_wget(job: Job) -> None:
 
     got_html = _has_html_files(site_dir)
 
-    if rc in (0, 8) and got_html:
-        # First attempt succeeded
+    if (rc in (0, 8) and got_html) or (pages_limit_hit and got_html):
+        # First attempt succeeded (or we intentionally stopped at the page limit)
         job.status = JobStatus.COMPLETED
-        await job.queue.put("[info] wget finished successfully.")
+        if pages_limit_hit:
+            await job.queue.put("[info] wget stopped at page limit — download complete.")
+        else:
+            await job.queue.put("[info] wget finished successfully.")
     elif not got_html:
         # No HTML downloaded — retry with browser User-Agent
         await job.queue.put("[warn] No HTML files downloaded. Retrying with browser User-Agent…")
@@ -448,7 +602,7 @@ async def _run_wget(job: Job) -> None:
             await job.queue.put("[done]")
             return
 
-        if rc in (0, 8) and _has_html_files(site_dir):
+        if (rc in (0, 8) or pages_limit_hit) and _has_html_files(site_dir):
             job.status = JobStatus.COMPLETED
             await job.queue.put("[info] Retry succeeded with browser User-Agent.")
         else:
@@ -479,6 +633,9 @@ def create_job(
     slug_raw: str | None,
     extra_domains_raw: str | None,
     remove_links: bool = False,
+    strip_dead_links: bool = False,
+    max_pages: int = 1,
+    crawl_depth: int = 0,
 ) -> Job:
     """Validate inputs, set up the output directory, return a Job."""
     url = _validate_url(url)
@@ -494,12 +651,19 @@ def create_job(
             d.strip() for d in re.split(r"[,\s]+", extra_domains_raw) if d.strip()
         ]
 
+    # Ensure sane minimums
+    max_pages = max(1, max_pages)
+    crawl_depth = max(0, crawl_depth)
+
     job = Job(
         job_id=uuid.uuid4().hex[:12],
         url=url,
         slug=slug,
         extra_domains=extra_domains,
         remove_links=remove_links,
+        strip_dead_links=strip_dead_links,
+        max_pages=max_pages,
+        crawl_depth=crawl_depth,
         output_dir=output_dir,
         site_dir=site_dir,
     )
@@ -516,6 +680,8 @@ async def run_clone(job: Job) -> None:
     await job.queue.put(f"[info] Host: {parsed.hostname}")
     await job.queue.put(f"[info] Slug: {job.slug}")
     await job.queue.put(f"[info] Output: {job.output_dir}")
+    await job.queue.put(f"[info] Max pages: {job.max_pages}")
+    await job.queue.put(f"[info] Crawl depth: {job.crawl_depth}")
     if job.extra_domains:
         await job.queue.put(f"[info] Extra domains: {', '.join(job.extra_domains)}")
 
@@ -533,9 +699,15 @@ async def run_clone(job: Job) -> None:
         noindex_count = _inject_noindex(job.site_dir)
         await job.queue.put(f"[info] Added noindex meta tag to {noindex_count} HTML file(s)")
 
-    # Post-processing: strip links if requested
+    # Post-processing: strip dead links (multi-page mode)
+    if job.strip_dead_links and not job.remove_links and job.status == JobStatus.COMPLETED:
+        await job.queue.put("[info] Stripping links to non-downloaded pages…")
+        dead_count = _strip_dead_links(job.site_dir)
+        await job.queue.put(f"[info] Stripped {dead_count} dead link(s)")
+
+    # Post-processing: strip ALL links if requested (single-page mode)
     if job.remove_links and job.status == JobStatus.COMPLETED:
-        await job.queue.put("[info] Removing links from HTML files…")
+        await job.queue.put("[info] Removing all links from HTML files…")
         count = _strip_links(job.site_dir)
         await job.queue.put(f"[info] Stripped href from {count} link(s)")
 
