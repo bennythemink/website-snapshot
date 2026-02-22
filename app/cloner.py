@@ -58,6 +58,7 @@ class Job:
     extra_domains: list[str]
     remove_links: bool = False
     strip_dead_links: bool = False
+    llm_export: bool = False
     max_pages: int = 1
     crawl_depth: int = 0
     status: JobStatus = JobStatus.PENDING
@@ -66,6 +67,7 @@ class Job:
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     error: Optional[str] = None
     main_html: Optional[str] = None
+    llm_export_file: Optional[str] = None
     created_at: float = field(default_factory=time.time)
 
 
@@ -140,9 +142,9 @@ def _find_main_html(site_dir: Path, url: str) -> str | None:
 
 
 def _strip_links(site_dir: Path) -> int:
-    """Remove href values from all <a> tags in HTML files under site_dir.
+    """Remove href attribute from all <a> tags in HTML files under site_dir.
 
-    Links remain visible but point nowhere (href="").
+    Links remain visible but become inert (href removed, not emptied).
     Returns the total number of links modified.
     """
     link_pattern = re.compile(
@@ -159,7 +161,7 @@ def _strip_links(site_dir: Path) -> int:
                 content = fpath.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            new_content, count = link_pattern.subn(r'\1 href=""', content)
+            new_content, count = link_pattern.subn(r'\1', content)
             if count > 0:
                 fpath.write_text(new_content, encoding="utf-8")
                 total += count
@@ -287,6 +289,239 @@ def _fix_css_fragment_references(site_dir: Path) -> int:
     return total_fixed
 
 
+def _rewrite_root_relative_urls(site_dir: Path) -> int:
+    """Convert root-relative URLs (/path/…) to relative URLs in HTML and CSS.
+
+    wget's ``--convert-links`` only runs when wget exits normally.  If wget
+    is terminated (SIGTERM for page / size limits) the conversion is skipped
+    and references stay root-relative (e.g. ``/Themes/style.css``).  These
+    break in the preview which serves files under ``/preview/{job_id}/…``
+    because the browser resolves them against the server root.
+
+    When ``--convert-links`` *has* already run, all references are already
+    relative so the regexes below match nothing and this is effectively a
+    no-op.
+
+    Returns the total number of URLs rewritten.
+    """
+    total = 0
+
+    for root, _dirs, files in os.walk(site_dir):
+        rel_dir = os.path.relpath(root, site_dir)
+        if rel_dir == ".":
+            prefix = ""
+        else:
+            depth = len(Path(rel_dir).parts)
+            prefix = "../" * depth
+
+        for fname in files:
+            fpath = Path(root) / fname
+            is_html = fname.endswith((".html", ".htm"))
+            is_css = fname.endswith(".css")
+            if not (is_html or is_css):
+                continue
+
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            original = content
+            file_count = 0
+
+            # HTML: rewrite href="/…", src="/…", action="/…"
+            if is_html:
+                # First: handle bare "/" → "index.html" (e.g. href="/")
+                # Uses a lookahead so we only match "/" immediately before the
+                # closing quote, not "/cables" etc.
+                def _repl_root(m, _pfx=prefix):
+                    nonlocal file_count
+                    file_count += 1
+                    return m.group(1) + _pfx + "index.html"
+
+                content = re.sub(
+                    r'((?:href|src|action)\s*=\s*["\'])/(?=["\'])',
+                    _repl_root,
+                    content,
+                    flags=re.IGNORECASE,
+                )
+
+                # Then: general root-relative rewrite  /foo → foo
+                def _repl_attr(m, _pfx=prefix):
+                    nonlocal file_count
+                    file_count += 1
+                    return m.group(1) + _pfx
+
+                content = re.sub(
+                    r'((?:href|src|action)\s*=\s*["\'])/(?!/)',
+                    _repl_attr,
+                    content,
+                    flags=re.IGNORECASE,
+                )
+
+            # CSS and inline styles: rewrite url(/…)
+            def _repl_url(m, _pfx=prefix):
+                nonlocal file_count
+                file_count += 1
+                return "url(" + m.group(1) + _pfx
+
+            content = re.sub(
+                r'url\(\s*(["\']?)/(?!/)',
+                _repl_url,
+                content,
+                flags=re.IGNORECASE,
+            )
+
+            if content != original:
+                fpath.write_text(content, encoding="utf-8")
+                total += file_count
+
+    return total
+
+
+def _fix_wget_filenames(site_dir: Path) -> int:
+    """Rewrite HTML/CSS references to match wget's on-disk filenames.
+
+    When wget is terminated before ``--convert-links`` runs, references in
+    HTML files keep their original form (e.g. ``styles.css?t=123``) while
+    the file on disk was saved with wget's filename mangling:
+
+    * ``--restrict-file-names=windows`` replaces ``?`` → ``@``
+    * ``--adjust-extension`` may append an extra ``.css`` / ``.html``
+
+    This function builds an index of every file on disk, then scans each
+    HTML/CSS file and rewrites ``href``, ``src``, and ``url()`` values to
+    point at the actual filenames that exist.
+
+    Returns the number of references fixed.
+    """
+    # Build lookup: relative-path → True for every file under site_dir
+    on_disk: set[str] = set()
+    for root, _dirs, files in os.walk(site_dir):
+        for fname in files:
+            rel = os.path.relpath(os.path.join(root, fname), site_dir)
+            on_disk.add(rel.replace(os.sep, "/"))
+
+    total = 0
+
+    def _mangle(ref: str) -> str | None:
+        """Try to find the mangled filename that matches *ref* on disk."""
+        # Strip fragment
+        base = ref.split("#")[0]
+        if not base:
+            return None
+
+        # Already exists as-is?
+        if base in on_disk:
+            return None
+
+        # Try ?→@ replacement (restrict-file-names=windows)
+        mangled = base.replace("?", "@")
+        if mangled in on_disk:
+            return mangled
+
+        # Try with extra extension appended (--adjust-extension)
+        for ext in (".css", ".html", ".htm", ".js"):
+            if (mangled + ext) in on_disk:
+                return mangled + ext
+            if (base + ext) in on_disk:
+                return base + ext
+
+        return None
+
+    def _resolve_and_fix(ref: str, file_rel_dir: str) -> str | None:
+        """Given a reference from an HTML/CSS file, return the fixed version or None."""
+        # Skip absolute URLs, fragments, data URIs, etc.
+        if not ref or ref.startswith(("http://", "https://", "//", "#", "data:", "javascript:", "mailto:", "tel:")):
+            return None
+
+        # Resolve relative to the file's directory
+        if file_rel_dir and file_rel_dir != ".":
+            full_ref = os.path.normpath(file_rel_dir + "/" + ref).replace(os.sep, "/")
+        else:
+            full_ref = os.path.normpath(ref).replace(os.sep, "/")
+
+        replacement = _mangle(full_ref)
+        if replacement is None:
+            return None
+
+        # Convert back to relative from this file's dir
+        if file_rel_dir and file_rel_dir != ".":
+            return os.path.relpath(replacement, file_rel_dir).replace(os.sep, "/")
+        return replacement
+
+    # Pattern for href="...", src="...", action="..."  (double or single quotes)
+    attr_re = re.compile(
+        r'((?:href|src|action)\s*=\s*["\'])([^"\']*?)(["\'])',
+        re.IGNORECASE,
+    )
+
+    for root, _dirs, files in os.walk(site_dir):
+        rel_dir = os.path.relpath(root, site_dir).replace(os.sep, "/")
+
+        for fname in files:
+            fpath = Path(root) / fname
+            is_html = fname.endswith((".html", ".htm"))
+            is_css = fname.endswith(".css")
+            if not (is_html or is_css):
+                continue
+
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            original = content
+
+            if is_html:
+                def _fix_html(m, _dir=rel_dir):
+                    nonlocal total
+                    fixed = _resolve_and_fix(m.group(2), _dir)
+                    if fixed is None:
+                        return m.group(0)
+                    total += 1
+                    return m.group(1) + fixed + m.group(3)
+
+                content = attr_re.sub(_fix_html, content)
+
+            # TODO: also fix url() in CSS files if needed in future
+
+            if content != original:
+                fpath.write_text(content, encoding="utf-8")
+
+    return total
+
+
+def _clean_empty_hrefs(site_dir: Path) -> int:
+    """Remove pre-existing ``href=""`` and ``href=''`` attributes from anchors.
+
+    Many sites include ``<a href="">`` placeholders (JS templates, etc.)
+    which cause the browser to reload the current page when clicked.
+    Converting them to plain ``<a>`` (no href) makes them inert.
+
+    Returns the number of links cleaned.
+    """
+    empty_href_re = re.compile(
+        r"""(<a\b[^>]*?)\s+href\s*=\s*(?:""|'')""",
+        re.IGNORECASE,
+    )
+    total = 0
+    for root, _dirs, files in os.walk(site_dir):
+        for fname in files:
+            if not fname.endswith((".html", ".htm")):
+                continue
+            fpath = Path(root) / fname
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            new_content, count = empty_href_re.subn(r'\1', content)
+            if count > 0:
+                fpath.write_text(new_content, encoding="utf-8")
+                total += count
+    return total
+
+
 def _strip_dead_links(site_dir: Path) -> int:
     """Remove href from <a> tags that point to pages not present in site_dir.
 
@@ -344,10 +579,39 @@ def _strip_dead_links(site_dir: Path) -> int:
 
                 # Parse and check if it's an external URL
                 parsed = _urlparse(stripped)
-                if parsed.scheme in ("http", "https", "//"):
-                    # External link — strip it
+                if parsed.scheme in ("http", "https") or stripped.startswith("//"):
+                    # Try to resolve the URL path to a downloaded file.
+                    # Same-site absolute links (e.g. https://example.com/cables)
+                    # should be converted to relative paths, not stripped.
+                    url_path = unquote(parsed.path).strip("/")
+                    if not url_path:
+                        url_path = "index.html"
+
+                    abs_candidates = [url_path]
+                    if not url_path.endswith((".html", ".htm")):
+                        abs_candidates.extend([
+                            url_path + ".html",
+                            url_path + "/index.html",
+                            url_path + "/index.htm",
+                        ])
+
+                    found = None
+                    for c in abs_candidates:
+                        if c in downloaded:
+                            found = c
+                            break
+
+                    if found is not None:
+                        # Convert to relative path from this file's directory
+                        if file_dir_rel and file_dir_rel != ".":
+                            rel = os.path.relpath(found, file_dir_rel).replace(os.sep, "/")
+                        else:
+                            rel = found
+                        return f'{match.group(1)} href="{rel}"'
+
+                    # Truly external / not downloaded — remove href
                     total += 1
-                    return f'{match.group(1)} href=""'
+                    return match.group(1)
 
                 # Resolve relative path
                 path_part = unquote(parsed.path)
@@ -368,9 +632,9 @@ def _strip_dead_links(site_dir: Path) -> int:
                     if candidate in downloaded:
                         return match.group(0)  # Link target exists — keep it
 
-                # Target not downloaded — strip the href
+                # Target not downloaded — remove href
                 total += 1
-                return f'{match.group(1)} href=""'
+                return match.group(1)
 
             new_content = href_re.sub(_check, content)
             if new_content != content:
@@ -388,9 +652,17 @@ def _write_robots_txt(site_dir: Path) -> None:
 def _inject_noindex(site_dir: Path) -> int:
     """Inject a noindex/nofollow meta tag into every HTML file's <head>.
 
+    Also injects a CSS rule so that ``<a>`` elements without an ``href``
+    attribute (dead-link-stripped anchors) look like plain text instead
+    of interactive links.
+
     Returns the number of files modified.
     """
     meta_tag = '<meta name="robots" content="noindex, nofollow">'
+    dead_link_css = (
+        '<style>a:not([href]){color:inherit;text-decoration:none;'
+        'pointer-events:none;cursor:default}</style>'
+    )
     head_pattern = re.compile(r"(<head[^>]*>)", re.IGNORECASE)
     count = 0
     for root, _dirs, files in os.walk(site_dir):
@@ -405,7 +677,7 @@ def _inject_noindex(site_dir: Path) -> int:
             if meta_tag in html:
                 continue  # already present
             new_html, replacements = head_pattern.subn(
-                rf"\1\n    {meta_tag}", html, count=1,
+                rf"\1\n    {meta_tag}\n    {dead_link_css}", html, count=1,
             )
             if replacements:
                 fpath.write_text(new_html, encoding="utf-8")
@@ -476,6 +748,81 @@ def _build_wget_args(
 # ---------------------------------------------------------------------------
 # Core async runner
 # ---------------------------------------------------------------------------
+
+async def _fetch_missing_assets(job: Job, user_agent: str | None = None) -> None:
+    """Run a supplementary non-recursive wget to fetch page requisites.
+
+    After the main recursive wget is killed at the page limit, some CSS/JS/
+    image files referenced by downloaded pages may not have been fetched yet.
+    This function runs wget **without** ``-r`` but **with** ``--page-requisites``
+    and ``--convert-links`` to fetch missing assets and fix references.
+    """
+    site_dir = job.site_dir
+    parsed = urlparse(job.url)
+    host = parsed.hostname or ""
+
+    args: list[str] = [
+        "wget",
+        "--page-requisites",
+        "--convert-links",
+        "--adjust-extension",
+        "--no-parent",
+        "--restrict-file-names=windows",
+        "--timeout=30",
+        "--tries=2",
+        "--no-verbose",
+        "-nH",
+        *((["--user-agent=" + user_agent] if user_agent else
+           ["--user-agent=" + BROWSER_USER_AGENT])),
+        "-e", "robots=off",
+        "-P", str(site_dir),
+    ]
+
+    all_domains = [host] + [d.strip() for d in job.extra_domains if d.strip()]
+    if len(all_domains) > 1:
+        args += ["--span-hosts", f"--domains={','.join(all_domains)}"]
+
+    args.append(job.url)
+
+    await job.queue.put("[info] Fetching missing page assets (supplementary pass)…")
+    await job.queue.put(f"[cmd] {' '.join(args)}")
+
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def _drain(stream: asyncio.StreamReader, prefix: str):
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").rstrip()
+            if text:
+                await job.queue.put(f"[{prefix}] {text}")
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(
+                _drain(proc.stdout, "wget-assets"),  # type: ignore[arg-type]
+                _drain(proc.stderr, "wget-assets"),  # type: ignore[arg-type]
+                proc.wait(),
+            ),
+            timeout=60,
+        )
+    except asyncio.TimeoutError:
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
+        await job.queue.put("[warn] Asset fetch timed out.")
+        return
+
+    new_files = sum(len(fs) for _, _, fs in os.walk(site_dir))
+    await job.queue.put(f"[info] Asset fetch complete (total files now: {new_files})")
+
 
 async def _run_wget(job: Job) -> None:
     """Spawn wget, stream output lines into job.queue, enforce limits.
@@ -586,6 +933,7 @@ async def _run_wget(job: Job) -> None:
         job.status = JobStatus.COMPLETED
         if pages_limit_hit:
             await job.queue.put("[info] wget stopped at page limit — download complete.")
+            await _fetch_missing_assets(job)
         else:
             await job.queue.put("[info] wget finished successfully.")
     elif not got_html:
@@ -605,6 +953,8 @@ async def _run_wget(job: Job) -> None:
         if (rc in (0, 8) or pages_limit_hit) and _has_html_files(site_dir):
             job.status = JobStatus.COMPLETED
             await job.queue.put("[info] Retry succeeded with browser User-Agent.")
+            if pages_limit_hit:
+                await _fetch_missing_assets(job, user_agent=BROWSER_USER_AGENT)
         else:
             await job.queue.put(f"[error] Retry also failed (exit code {rc}).")
             job.status = JobStatus.FAILED
@@ -634,6 +984,7 @@ def create_job(
     extra_domains_raw: str | None,
     remove_links: bool = False,
     strip_dead_links: bool = False,
+    llm_export: bool = False,
     max_pages: int = 1,
     crawl_depth: int = 0,
 ) -> Job:
@@ -662,6 +1013,7 @@ def create_job(
         extra_domains=extra_domains,
         remove_links=remove_links,
         strip_dead_links=strip_dead_links,
+        llm_export=llm_export,
         max_pages=max_pages,
         crawl_depth=crawl_depth,
         output_dir=output_dir,
@@ -693,6 +1045,14 @@ async def run_clone(job: Job) -> None:
         frag_count = _fix_css_fragment_references(job.site_dir)
         await job.queue.put(f"[info] Restored {frag_count} CSS fragment reference(s)")
 
+        await job.queue.put("[info] Converting root-relative URLs to relative paths…")
+        rewrite_count = _rewrite_root_relative_urls(job.site_dir)
+        await job.queue.put(f"[info] Rewrote {rewrite_count} root-relative URL(s)")
+
+        await job.queue.put("[info] Fixing wget filename mangling (query strings, extensions)…")
+        fname_count = _fix_wget_filenames(job.site_dir)
+        await job.queue.put(f"[info] Fixed {fname_count} mangled filename reference(s)")
+
         await job.queue.put("[info] Adding robots.txt (disallow all crawlers)")
         _write_robots_txt(job.site_dir)
         await job.queue.put("[info] Injecting noindex meta tags into HTML files…")
@@ -710,6 +1070,27 @@ async def run_clone(job: Job) -> None:
         await job.queue.put("[info] Removing all links from HTML files…")
         count = _strip_links(job.site_dir)
         await job.queue.put(f"[info] Stripped href from {count} link(s)")
+
+    # Post-processing: clean up any remaining empty href="" attributes
+    # (from original site HTML or our stripping) so clicks don't reload the page.
+    if job.status == JobStatus.COMPLETED:
+        await job.queue.put("[info] Cleaning up empty href attributes…")
+        empty_count = _clean_empty_hrefs(job.site_dir)
+        await job.queue.put(f"[info] Cleaned {empty_count} empty href(s)")
+
+    # LLM Markdown export (if requested)
+    if job.llm_export and job.status == JobStatus.COMPLETED:
+        from app.llm_export import generate_llm_export
+
+        await job.queue.put("[info] Generating LLM Markdown export…")
+        md_path = job.output_dir / f"{job.slug}-llm.md"
+        try:
+            generate_llm_export(job.site_dir, md_path, job.url)
+            job.llm_export_file = md_path.name
+            await job.queue.put(f"[info] LLM export saved: {md_path.name}")
+            await job.queue.put("[llm_link]")
+        except Exception as exc:
+            await job.queue.put(f"[warn] LLM export failed: {exc}")
 
     if job.status == JobStatus.COMPLETED:
         generate_bundle(job)

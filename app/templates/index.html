@@ -372,6 +372,17 @@
           </div>
         </div>
 
+        <!-- LLM export (always visible) -->
+        <div id="llm-export-field" class="field checkbox-field">
+          <label class="checkbox-label">
+            <input type="checkbox" id="llm_export" name="llm_export" />
+            <span>Export for LLM</span>
+          </label>
+          <div class="hint">
+            Generate a single Markdown file with the page content optimised for feeding into an LLM.
+          </div>
+        </div>
+
         <div class="button-row">
           <button type="button" id="btn-clear" class="btn-secondary">
             <svg
@@ -456,6 +467,7 @@
       const maxPagesInput = document.getElementById('max_pages')
       const stripDeadLinksInput = document.getElementById('strip_dead_links')
       const removeLinksInput = document.getElementById('remove_links')
+      const llmExportInput = document.getElementById('llm_export')
 
       let currentMode = 'single'
 
@@ -528,6 +540,7 @@
           extra_domains: document.getElementById('extra_domains').value.trim() || null,
           remove_links: isSingle ? removeLinksInput.checked : false,
           strip_dead_links: isSingle ? false : stripDeadLinksInput.checked,
+          llm_export: llmExportInput.checked,
           max_pages: isSingle ? 1 : parseInt(maxPagesInput.value, 10) || 100,
           crawl_depth: isSingle ? 0 : parseInt(crawlDepthInput.value, 10) || 1
         }
@@ -571,6 +584,19 @@
           appendLog(e.data)
         })
 
+        evtSource.addEventListener('llm_link', (e) => {
+          const link = document.createElement('a')
+          link.href = e.data
+          link.target = '_blank'
+          link.download = ''
+          link.textContent = '📄 Download LLM Markdown'
+          link.style.cssText =
+            'display:inline-block;margin:0.5rem 0;padding:0.45rem 1rem;background:var(--accent);color:#fff;border-radius:6px;text-decoration:none;font-size:0.85rem;'
+          logEl.appendChild(link)
+          logEl.appendChild(document.createTextNode('\n'))
+          logEl.scrollTop = logEl.scrollHeight
+        })
+
         evtSource.addEventListener('done', (e) => {
           evtSource.close()
           const info = JSON.parse(e.data)
@@ -593,6 +619,7 @@
         document.getElementById('slug').value = ''
         document.getElementById('extra_domains').value = ''
         removeLinksInput.checked = false
+        llmExportInput.checked = false
         setMode('single')
         logSection.classList.remove('visible')
         resultSection.classList.remove('visible')
@@ -629,6 +656,13 @@
           html += `<div class="result-row">
           <span class="label-text">Preview:</span>
           <a href="${info.preview_url}" target="_blank">Open preview ↗</a>
+        </div>`
+        }
+
+        if (info.llm_export_url) {
+          html += `<div class="result-row">
+          <span class="label-text">LLM Export:</span>
+          <a href="${info.llm_export_url}" target="_blank" download>Download Markdown ↓</a>
         </div>`
         }
 

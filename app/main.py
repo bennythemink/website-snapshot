@@ -49,6 +49,7 @@ class CloneRequest(BaseModel):
     extra_domains: str | None = None
     remove_links: bool = False
     strip_dead_links: bool = False
+    llm_export: bool = False
     max_pages: int = 1
     crawl_depth: int = 0
 
@@ -79,6 +80,7 @@ async def start_clone(body: CloneRequest):
             body.extra_domains,
             body.remove_links,
             body.strip_dead_links,
+            body.llm_export,
             body.max_pages,
             body.crawl_depth,
         )
@@ -110,6 +112,12 @@ async def clone_events(job_id: str):
                 yield {"event": "ping", "data": "keep-alive"}
                 continue
 
+            if msg == "[llm_link]":
+                # Emit a dedicated event so the UI can render a download link immediately
+                url = f"/api/clone/{job.job_id}/llm-export"
+                yield {"event": "llm_link", "data": url}
+                continue
+
             if msg == "[done]":
                 # Send final summary
                 payload = {
@@ -119,6 +127,8 @@ async def clone_events(job_id: str):
                 }
                 if job.main_html:
                     payload["preview_url"] = f"/preview/{job.job_id}/{job.main_html}"
+                if job.llm_export_file:
+                    payload["llm_export_url"] = f"/api/clone/{job.job_id}/llm-export"
                 if job.error:
                     payload["error"] = job.error
 
@@ -131,7 +141,7 @@ async def clone_events(job_id: str):
 
 
 @app.get("/preview/{job_id}/{path:path}")
-async def preview(job_id: str, path: str):
+async def preview(job_id: str, path: str, request: Request):
     """Serve a file from the downloaded site folder for in-browser preview."""
     job = jobs.get(job_id)
     if not job:
@@ -139,12 +149,33 @@ async def preview(job_id: str, path: str):
 
     file_path = job.site_dir / path
     if not file_path.exists() or not file_path.is_file():
-        # Try with index.html appended
+        # Try with index.html appended (directory index)
         index_path = file_path / "index.html"
         if index_path.exists():
             file_path = index_path
         else:
-            raise HTTPException(status_code=404, detail="File not found.")
+            # Try wget filename mangling: ?→@ and possible extra extension
+            # The browser may send query string separately or URL-encoded in path
+            qs = str(request.query_params)
+            if qs:
+                # Browser sent ?key=val — wget saves as file@key=val or file@key=val.ext
+                mangled = path + "@" + qs
+                for candidate in [mangled, mangled + ".css", mangled + ".html", mangled + ".js"]:
+                    cp = job.site_dir / candidate
+                    if cp.exists() and cp.is_file():
+                        file_path = cp
+                        break
+                else:
+                    raise HTTPException(status_code=404, detail="File not found.")
+            else:
+                # Also try appending common extensions (adjust-extension)
+                for ext in [".html", ".css", ".js"]:
+                    cp = file_path.parent / (file_path.name + ext)
+                    if cp.exists() and cp.is_file():
+                        file_path = cp
+                        break
+                else:
+                    raise HTTPException(status_code=404, detail="File not found.")
 
     # Security: ensure we stay within the site dir
     try:
@@ -153,6 +184,26 @@ async def preview(job_id: str, path: str):
         raise HTTPException(status_code=403, detail="Forbidden.")
 
     return FileResponse(file_path)
+
+
+@app.get("/api/clone/{job_id}/llm-export")
+async def download_llm_export(job_id: str):
+    """Download the LLM Markdown export for a completed job."""
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if not job.llm_export_file:
+        raise HTTPException(status_code=404, detail="No LLM export available.")
+
+    file_path = job.output_dir / job.llm_export_file
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Export file not found on disk.")
+
+    return FileResponse(
+        file_path,
+        media_type="text/markdown",
+        filename=job.llm_export_file,
+    )
 
 
 @app.get("/api/jobs")
